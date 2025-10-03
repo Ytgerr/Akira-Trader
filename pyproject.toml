@@ -12,6 +12,7 @@ dependencies = [
     "click>=8.1.7,<9",
     "tqdm>=4.67.1,<5",
     "streamlit>=1.40.2,<2",
+    "dotenv>=0.9.9",
 ]
 
 [project.scripts]
