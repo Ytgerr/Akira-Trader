@@ -12,21 +12,63 @@
     --test-file PATH      Путь к test.csv (по умолчанию: data/processed/test.csv)
     --train-file PATH     Путь к train.csv (по умолчанию: data/processed/train.csv)
     --output-file PATH    Путь к submission.csv (по умолчанию: data/processed/submission.csv)
-    --num-examples INT    Количество примеров для few-shot (по умолчанию: 10)
+    --num-examples INT    Количество примеров для few-shot (по умолчанию: 7)
     --batch-size INT      Размер батча для обработки (по умолчанию: 5)
 """
 
 import csv
 import random
 from pathlib import Path
-
+import faiss
+from sentence_transformers import SentenceTransformer
 import click
 from tqdm import tqdm  # type: ignore[import-untyped]
+import concurrent.futures
+from typing import List, Dict, Tuple
 
 from src.app.core.llm import call_llm
 
+VALID_ENDPOINTS = [
+    "/v1/exchanges",
+    "/v1/assets",
+    "/v1/assets/{symbol}",
+    "/v1/assets/{symbol}/params",
+    "/v1/assets/{symbol}/schedule",
+    "/v1/assets/{symbol}/options",
+    "/v1/instruments/{symbol}/quotes/latest",
+    "/v1/instruments/{symbol}/orderbook",
+    "/v1/instruments/{symbol}/trades/latest",
+    "/v1/instruments/{symbol}/bars",
+    "/v1/accounts/{account_id}",
+    "/v1/accounts/{account_id}/orders",
+    "/v1/accounts/{account_id}/orders/{order_id}",
+    "/v1/accounts/{account_id}/trades",
+    "/v1/accounts/{account_id}/transactions",
+    "/v1/sessions",
+    "/v1/sessions/details",
+    "/v1/accounts/{account_id}/orders",
+    "/v1/accounts/{account_id}/orders/{order_id}",
+]
 
-def calculate_cost(usage: dict, model: str) -> float:
+TIMEFRAMES = [
+    "TIME_FRAME_M1", "TIME_FRAME_M5", "TIME_FRAME_M15", "TIME_FRAME_M30",
+    "TIME_FRAME_H1", "TIME_FRAME_H4", "TIME_FRAME_D", "TIME_FRAME_W", "TIME_FRAME_MN"
+]
+
+def build_faiss_index(train_examples: List[Dict[str, str]]) -> Tuple:
+    model = SentenceTransformer("Snowflake/snowflake-arctic-embed-l-v2.0")  
+    questions = [ex["question"] for ex in train_examples]
+    embeddings = model.encode(questions, convert_to_numpy=True)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index, embeddings, model, train_examples
+
+def find_similar_examples(question: str, index, embeddings, model, train_examples: List[Dict[str, str]], top_k: int = 5) -> List[Dict[str, str]]:
+    q_emb = model.encode([question], convert_to_numpy=True)
+    D, I = index.search(q_emb, top_k)
+    return [train_examples[i] for i in I[0]]
+
+def calculate_cost(usage: Dict, model: str) -> float:
     """Рассчитать стоимость запроса на основе usage и модели"""
     # Цены OpenRouter (примерные, в $ за 1M токенов)
     # Источник: https://openrouter.ai/models
@@ -50,8 +92,7 @@ def calculate_cost(usage: dict, model: str) -> float:
 
     return prompt_cost + completion_cost
 
-
-def load_train_examples(train_file: Path, num_examples: int = 10) -> list[dict[str, str]]:
+def load_train_examples(train_file: Path, num_examples: int = 100) -> List[Dict[str, str]]:
     """Загрузить примеры из train.csv для few-shot learning"""
     examples = []
     with open(train_file, encoding="utf-8") as f:
@@ -66,15 +107,14 @@ def load_train_examples(train_file: Path, num_examples: int = 10) -> list[dict[s
 
     # Формируем сбалансированный набор
     selected = []
-    selected.extend(random.sample(get_examples, min(num_examples - 3, len(get_examples))))
-    selected.extend(random.sample(post_examples, min(2, len(post_examples))))
-    selected.extend(random.sample(delete_examples, min(1, len(delete_examples))))
+    selected.extend(random.sample(get_examples, min(num_examples // 2, len(get_examples))))
+    selected.extend(random.sample(post_examples, min(num_examples // 4, len(post_examples))))
+    selected.extend(random.sample(delete_examples, min(num_examples // 4, len(delete_examples))))
 
     return selected[:num_examples]
 
-
-def create_prompt(question: str, examples: list[dict[str, str]]) -> str:
-    """Создать промпт для LLM с few-shot примерами"""
+def create_prompt(questions: List[str], examples: List[Dict[str, str]], similar_examples_list: List[List[Dict[str, str]]]) -> str:
+    """Создать промпт для LLM с few-shot примерами для батча вопросов"""
     prompt = """Ты - эксперт по Finam TradeAPI. Твоя задача - преобразовать вопрос на русском языке в HTTP запрос к API.
 
 API Documentation:
@@ -102,6 +142,13 @@ API Documentation:
 Timeframes: TIME_FRAME_M1, TIME_FRAME_M5, TIME_FRAME_M15, TIME_FRAME_M30,
 TIME_FRAME_H1, TIME_FRAME_H4, TIME_FRAME_D, TIME_FRAME_W, TIME_FRAME_MN
 
+Инструкции:
+Сначала проанализируй каждый вопрос шаг за шагом:
+1. Определи, какой эндпоинт API подходит (на основе документации).
+2. Выдели параметры из вопроса (например, symbol, timeframe, dates). Даты форматируй как YYYY-MM-DD. Timeframe используй только из списка.
+3. Выбери правильный метод (GET для чтения, POST для создания, DELETE для удаления).
+4. Если вопрос не связан с API, используй fallback: GET /v1/assets
+
 Примеры:
 
 """
@@ -110,71 +157,81 @@ TIME_FRAME_H1, TIME_FRAME_H4, TIME_FRAME_D, TIME_FRAME_W, TIME_FRAME_MN
         prompt += f'Вопрос: "{ex["question"]}"\n'
         prompt += f"Ответ: {ex['type']} {ex['request']}\n\n"
 
-    prompt += f'Вопрос: "{question}"\n'
-    prompt += "Ответ (только HTTP метод и путь, без объяснений):"
+
+    for idx, sim_exs in enumerate(similar_examples_list):
+        prompt += f"\nПохожие примеры для вопроса {idx+1}:\n"
+        for ex in sim_exs:
+            prompt += f'Вопрос: "{ex["question"]}"\n'
+            prompt += f"Ответ: {ex['type']} {ex['request']}\n\n"
+
+    prompt += "\nТеперь обработай следующие вопросы. Для каждого выдай ответ только в формате: [ID] METHOD /path?params\n"
+    for i, q in enumerate(questions):
+        prompt += f'Вопрос [{i+1}]: "{q}"\n'
+
+    prompt += "\nОтветы (только в указанном формате, без объяснений):"
 
     return prompt
 
+def parse_llm_response(response: str) -> List[Tuple[str, str]]:
+    """Парсинг ответа LLM для батча в список (type, request)"""
+    lines = response.strip().split("\n")
+    results = []
+    for line in lines:
+        if line.startswith("[") and "]" in line:
+            try:
+                # Извлекаем [ID] METHOD /path
+                parts = line.split(" ", 2)
+                method = parts[1].strip()
+                request = parts[2].strip()
+                results.append((method, request))
+            except:
+                results.append(("GET", "/v1/assets"))  # Fallback
+    return results
 
-def parse_llm_response(response: str) -> tuple[str, str]:
-    """Парсинг ответа LLM в (type, request)"""
-    response = response.strip()
+def validate_request(method: str, request: str) -> Tuple[str, str]:
+    """Валидация и пост-обработка запроса"""
+    if method not in ["GET", "POST", "DELETE"]:
+        method = "GET"
 
-    # Ищем HTTP метод в начале
-    methods = ["GET", "POST", "DELETE", "PUT", "PATCH"]
-    method = "GET"  # по умолчанию
-    request = response
-
-    for m in methods:
-        if response.upper().startswith(m):
-            method = m
-            request = response[len(m) :].strip()
-            break
-
-    # Убираем лишние символы
-    request = request.strip()
     if not request.startswith("/"):
-        # Если LLM вернул что-то странное, пытаемся найти путь
-        parts = request.split()
-        for part in parts:
-            if part.startswith("/"):
-                request = part
-                break
+        request = "/" + request
 
-    # Fallback на безопасный вариант
-    if not request.startswith("/"):
-        request = "/v1/assets"
+    base_path = request.split("?")[0]
+    if base_path not in VALID_ENDPOINTS:
+        from difflib import get_close_matches
+        closest = get_close_matches(base_path, VALID_ENDPOINTS, n=1, cutoff=0.6)
+        if closest:
+            base_path = closest[0]
 
-    return method, request
+    return method, base_path + ("?" + request.split("?")[1] if "?" in request else "")
 
+def generate_api_calls_batch(questions: List[str], examples: List[Dict[str, str]], similar_examples_list: List[List[Dict[str, str]]], model: str, max_retries: int = 3) -> Tuple[List[Dict[str, str]], float]:
+    """Сгенерировать API запросы для батча вопросов"""
+    total_cost = 0.0
+    results = [{"type": "GET", "request": "/v1/assets"} for _ in questions]  # Fallback
 
-def generate_api_call(question: str, examples: list[dict[str, str]], model: str) -> tuple[dict[str, str], float]:
-    """Сгенерировать API запрос для вопроса
+    for attempt in range(max_retries):
+        try:
+            prompt = create_prompt(questions, examples, similar_examples_list)
+            messages = [{"role": "user", "content": prompt}]
+            response = call_llm(messages, temperature=0.0 if attempt == 0 else 0.1, max_tokens=500)
+            llm_answer = response["choices"][0]["message"]["content"].strip()
 
-    Returns:
-        tuple: (result_dict, cost_in_dollars)
-    """
-    prompt = create_prompt(question, examples)
+            parsed = parse_llm_response(llm_answer)
+            if len(parsed) == len(questions):
+                for i, (method, request) in enumerate(parsed):
+                    method, request = validate_request(method, request)
+                    results[i] = {"type": method, "request": request}
 
-    messages = [{"role": "user", "content": prompt}]
+            usage = response.get("usage", {})
+            total_cost += calculate_cost(usage, model)
+            break  # Успех
+        except Exception as e:
+            click.echo(f"⚠️  Ошибка при генерации батча (попытка {attempt+1}): {e}", err=True)
+            if attempt == max_retries - 1:
+                click.echo("🚨 Максимум попыток достигнут, использую fallback", err=True)
 
-    try:
-        response = call_llm(messages, temperature=0.0, max_tokens=200)
-        llm_answer = response["choices"][0]["message"]["content"].strip()
-
-        method, request = parse_llm_response(llm_answer)
-
-        # Рассчитываем стоимость
-        usage = response.get("usage", {})
-        cost = calculate_cost(usage, model)
-
-        return {"type": method, "request": request}, cost
-
-    except Exception as e:
-        click.echo(f"⚠️  Ошибка при генерации для вопроса '{question[:50]}...': {e}", err=True)
-        # Возвращаем fallback
-        return {"type": "GET", "request": "/v1/assets"}, 0.0
-
+    return results, total_cost
 
 @click.command()
 @click.option(
@@ -195,8 +252,9 @@ def generate_api_call(question: str, examples: list[dict[str, str]], model: str)
     default="data/processed/submission.csv",
     help="Путь к submission.csv",
 )
-@click.option("--num-examples", type=int, default=10, help="Количество примеров для few-shot")
-def main(test_file: Path, train_file: Path, output_file: Path, num_examples: int) -> None:
+@click.option("--num-examples", type=int, default=7, help="Количество примеров для few-shot")
+@click.option("--batch-size", type=int, default=5, help="Размер батча для обработки")
+def main(test_file: Path, train_file: Path, output_file: Path, num_examples: int, batch_size: int) -> None:
     """Генерация submission.csv для хакатона"""
     from src.app.core.config import get_settings
 
@@ -208,34 +266,44 @@ def main(test_file: Path, train_file: Path, output_file: Path, num_examples: int
     model = settings.openrouter_model
 
     # Загружаем примеры для few-shot
-    examples = load_train_examples(train_file, num_examples)
+    examples = load_train_examples(train_file, 100)
+    index, emb_matrix, emb_model, train_examples = build_faiss_index(examples)
     click.echo(f"✅ Загружено {len(examples)} примеров для few-shot learning")
     click.echo(f"🤖 Используется модель: {model}")
 
     # Читаем тестовый набор
     click.echo(f"📖 Чтение {test_file}...")
-    test_questions = []
+    test_items = []
     with open(test_file, encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=";")
         for row in reader:
-            test_questions.append({"uid": row["uid"], "question": row["question"]})
+            test_items.append({"uid": row["uid"], "question": row["question"]})
 
-    click.echo(f"✅ Найдено {len(test_questions)} вопросов для обработки")
+    click.echo(f"✅ Найдено {len(test_items)} вопросов для обработки")
 
-    # Генерируем ответы
+    # Генерируем ответы батчами с параллелизмом
     click.echo("\n🤖 Генерация API запросов с помощью LLM...")
     results = []
     total_cost = 0.0
 
-    # Используем tqdm с postfix для отображения стоимости
-    progress_bar = tqdm(test_questions, desc="Обработка")
-    for item in progress_bar:
-        api_call, cost = generate_api_call(item["question"], examples, model)
-        total_cost += cost
-        results.append({"uid": item["uid"], "type": api_call["type"], "request": api_call["request"]})
+    def process_batch(batch_items):
+        questions = [item["question"] for item in batch_items]
+        similar_examples_list = [find_similar_examples(q, index, emb_matrix, emb_model, train_examples, top_k=3) for q in questions]
+        api_calls, cost = generate_api_calls_batch(questions, random.sample(examples, num_examples), similar_examples_list, model)
+        return [{"uid": batch_items[i]["uid"], **call} for i, call in enumerate(api_calls)], cost
 
-        # Обновляем postfix с текущей стоимостью
-        progress_bar.set_postfix({"cost": f"${total_cost:.4f}"})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:  # Параллелизм для батчей
+        futures = []
+        for i in range(0, len(test_items), batch_size):
+            batch = test_items[i:i + batch_size]
+            futures.append(executor.submit(process_batch, batch))
+
+        progress_bar = tqdm(futures, desc="Обработка батчей")
+        for future in progress_bar:
+            batch_results, batch_cost = future.result()
+            results.extend(batch_results)
+            total_cost += batch_cost
+            progress_bar.set_postfix({"cost": f"${total_cost:.4f}"})
 
     # Записываем в submission.csv
     click.echo(f"\n💾 Сохранение результатов в {output_file}...")
@@ -250,12 +318,11 @@ def main(test_file: Path, train_file: Path, output_file: Path, num_examples: int
     click.echo(f"\n💰 Общая стоимость генерации: ${total_cost:.4f}")
     click.echo(f"   Средняя стоимость на запрос: ${total_cost / len(results):.6f}")
     click.echo("\n📊 Статистика по типам запросов:")
-    type_counts: dict[str, int] = {}
+    type_counts: Dict[str, int] = {}
     for r in results:
         type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
     for method, count in sorted(type_counts.items()):
         click.echo(f"  {method}: {count}")
-
 
 if __name__ == "__main__":
     main()
