@@ -1,37 +1,47 @@
-[tool.poetry]
+[project]
 name = "finam-x-hse-trade-ai-hack-trader"
 version = "0.1.0"
 description = "Trader AI Assistant over Finam TradeAPI"
-authors = ["Maxim Kirilyuk <werserk@inbox.ru>"]
+authors = [{ name = "Maxim Kirilyuk", email = "werserk@inbox.ru" }]
+requires-python = ">=3.11"
 readme = "README.md"
-packages = [{ include = "app", from = "src" }]
+dependencies = [
+    "pydantic>=2.11.9,<3",
+    "requests>=2.32.5,<3",
+    "python-dotenv>=1.1.1,<2",
+    "click>=8.1.7,<9",
+    "tqdm>=4.67.1,<5",
+    "streamlit>=1.40.2,<2",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.11"
-pydantic = "^2.11.9"
-requests = "^2.32.5"
-python-dotenv = "^1.1.1"
-click = "^8.1.7"
-tqdm = "^4.67.1"
-streamlit = "^1.40.2"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.4.2"
-httpx = "^0.28.1"
-black = "^25.9.0"
-ruff = "^0.13.3"
-types-requests = "^2.32.0"
-
-[tool.poetry.scripts]
+[project.scripts]
 validate-submission = "scripts.validate_submission:main"
 generate-submission = "scripts.generate_submission:main"
 calculate-metrics = "scripts.calculate_metrics:main"
 evaluate = "scripts.evaluate:evaluate"
 chat-cli = "src.app.interfaces.chat_cli:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2,<9",
+    "httpx>=0.28.1,<0.29",
+    "black>=25.9.0,<26",
+    "ruff>=0.13.3,<0.14",
+    "types-requests>=2.32.0,<3",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/app"]
+
+[tool.hatch.build.targets.wheel]
+include = ["src/app"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/app" = "app"
+
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 120
